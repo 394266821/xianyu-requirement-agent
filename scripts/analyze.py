@@ -124,30 +124,39 @@ def analyze_image(image_path: str) -> dict:
     """
     分析图片内容
     支持 URL 或本地文件路径
+    使用 MiniMax Token Plan VLM API
     """
-    # 判断是 URL 还是本地文件
+    import base64
+    import requests
+
+    # 获取 API key
+    with open(os.path.expanduser('~/.claude/settings.json')) as f:
+        settings = json.load(f)
+    token = settings.get("env", {}).get("ANTHROPIC_AUTH_TOKEN", "")
+    api_host = "https://api.minimaxi.com"
+
+    # 下载图片并转为 base64 data URL
     if image_path.startswith("http://") or image_path.startswith("https://"):
-        content = [
-            {"type": "text", "text": "请描述这张图片的内容：1) 图片类型（截图/设计稿/照片等）2) 主要内容 3) 如果是 UI 设计，描述布局和功能元素。如果看不到图片，请明确说'无法看到图片'。"},
-            {"type": "image", "source": {"type": "url", "url": image_path}}
-        ]
+        try:
+            resp = requests.get(image_path, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            img_data = resp.content
+            ct = resp.headers.get('content-type', 'image/jpeg').lower()
+            fmt = 'jpeg' if 'jpeg' in ct else 'png' if 'png' in ct else 'webp' if 'webp' in ct else 'jpeg'
+        except Exception as e:
+            return {
+                "description": f"图片下载失败: {e}",
+                "type": "error",
+                "ui_elements": "",
+                "requirement_related": ""
+            }
     else:
         # 本地文件
         try:
             with open(image_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode()
+                img_data = f.read()
             ext = Path(image_path).suffix.lower()
-            mime_type = {
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".png": "image/png",
-                ".gif": "image/gif",
-                ".webp": "image/webp"
-            }.get(ext, "image/jpeg")
-            content = [
-                {"type": "text", "text": "请描述这张图片的内容：1) 图片类型 2) 主要内容 3) UI 设计元素。如果看不到图片，请明确说'无法看到图片'。"},
-                {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": img_data}}
-            ]
+            fmt = 'jpeg' if ext in ['.jpg', '.jpeg'] else 'png' if ext == '.png' else 'webp' if ext == '.webp' else 'jpeg'
         except Exception as e:
             return {
                 "description": f"无法读取图片文件: {e}",
@@ -156,22 +165,48 @@ def analyze_image(image_path: str) -> dict:
                 "requirement_related": ""
             }
 
+    # 转为 data URL
+    img_b64 = base64.b64encode(img_data).decode()
+    data_url = f"data:image/{fmt};base64,{img_b64}"
+
+    # 调用 MiniMax Token Plan VLM API
+    url = f"{api_host}/v1/coding_plan/vlm"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "prompt": "请描述这张图片的内容：1) 图片类型（截图/设计稿/照片等）2) 主要内容 3) 如果是UI设计，描述布局和功能元素。回答简洁。",
+        "image_url": data_url
+    }
+
     try:
-        # MiniMax 目前视觉支持有限，尝试调用
-        response = call_api([{"role": "user", "content": content}])
-        if "无法看到" in response or "没有看到" in response or "看不到" in response:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        data = resp.json()
+        content = data.get("content", "")
+        if content:
             return {
-                "description": "API 暂不支持图片分析",
-                "type": "unsupported",
+                "description": content,
+                "type": "image",
                 "ui_elements": "",
-                "requirement_related": f"原始响应: {response[:200]}"
+                "requirement_related": ""
             }
-        return {
-            "description": response,
-            "type": "image",
-            "ui_elements": "",
-            "requirement_related": ""
-        }
+        else:
+            base_resp = data.get("base_resp", {})
+            status_code = base_resp.get("status_code", 0)
+            if status_code == 1026:
+                return {
+                    "description": "图片内容涉及敏感信息，无法分析",
+                    "type": "sensitive",
+                    "ui_elements": "",
+                    "requirement_related": ""
+                }
+            return {
+                "description": f"API 返回异常: {base_resp.get('status_msg', 'unknown')}",
+                "type": "error",
+                "ui_elements": "",
+                "requirement_related": str(data)
+            }
     except Exception as e:
         return {
             "description": f"图片分析失败: {e}",
